@@ -219,40 +219,42 @@ def run(rank, n_gpus, hps):
     scaler = GradScaler(enabled=hps.train.fp16_run)
 
     cache = []
-    for epoch in range(epoch_str, hps.train.epochs + 1):
-        if rank == 0:
-            # Записываем эпоху в лог
-            epoch_recorder.record()
-            logger.info(f"Epoch {epoch}/{hps.train.epochs}")
-            train_and_evaluate(
-                rank,
-                epoch,
-                hps,
-                [net_g, net_d],
-                [optim_g, optim_d],
-                [scheduler_g, scheduler_d],
-                scaler,
-                [train_loader, None],
-                logger,
-                [writer, writer_eval],
-                cache,
-            )
-        else:
-            train_and_evaluate(
-                rank,
-                epoch,
-                hps,
-                [net_g, net_d],
-                [optim_g, optim_d],
-                [scheduler_g, scheduler_d],
-                scaler,
-                [train_loader, None],
-                None,
-                None,
-                cache,
-            )
-        scheduler_g.step()
-        scheduler_d.step()
+   for epoch in range(epoch_str, hps.train.epochs + 1):
+    if rank == 0:
+        train_and_evaluate(
+            rank,
+            epoch,
+            hps,
+            [net_g, net_d],
+            [optim_g, optim_d],
+            [scheduler_g, scheduler_d],
+            scaler,
+            [train_loader, None],
+            logger,
+            [writer, writer_eval],
+            cache,
+        )
+    else:
+        train_and_evaluate(
+            rank,
+            epoch,
+            hps,
+            [net_g, net_d],
+            [optim_g, optim_d],
+            [scheduler_g, scheduler_d],
+            scaler,
+            [train_loader, None],
+            None,
+            None,
+            cache,
+        )
+    
+    # Вывод текущей эпохи
+    print(f"Эпоха {epoch} завершена")
+    time.sleep(1)  # Для предотвращения слишком быстрого вывода
+
+    scheduler_g.step()
+    scheduler_d.step()
 
 
 def train_and_evaluate(
