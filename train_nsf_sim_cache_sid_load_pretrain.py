@@ -3,20 +3,29 @@ import os, sys
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
 
-from lib.train.utils import EpochRecorder  # Import the EpochRecorder class #varaslaw
-from lib.train import utils
+from lib.train.utils import EpochRecorder  # Import the EpochRecorder class #vara2
 
 hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
 
+import os
+import sys
+import datetime
+from random import shuffle, randint
 import torch
 
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = False
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+now_dir = os.getcwd()
+sys.path.append(os.path.join(now_dir))
+
+from lib.train import utils
+from lib.train.data_utils import (
+    TextAudioLoaderMultiNSFsid,
+    TextAudioLoader,
+    TextAudioCollateMultiNSFsid,
+    TextAudioCollate,
+    DistributedBucketSampler,
+)
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -24,12 +33,6 @@ from torch.cuda.amp import autocast, GradScaler
 from lib.infer_pack import commons
 from time import sleep
 from time import time as ttime
-from lib.train.data_utils import (
-    TextAudioLoaderMultiNSFsid,
-    TextAudioLoader,
-    TextAudioCollateMultiNSFsid,
-    TextAudioCollate,
-    DistributedBucketSampler,
 )
 
 if hps.version == "v1":
@@ -49,7 +52,6 @@ from lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from lib.train.process_ckpt import savee
 
 global_step = 0
-
 
 class EpochRecorder:
     def __init__(self):
@@ -99,6 +101,8 @@ def run(rank, n_gpus, hps):
         logger.info(hps)
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
+        # Создаем экземпляр EpochRecorder для записи времени и эпохи в лог
+        epoch_recorder = EpochRecorder()
 
     dist.init_process_group(
         backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
@@ -217,6 +221,9 @@ def run(rank, n_gpus, hps):
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
+            # Записываем эпоху в лог
+            epoch_recorder.record()
+            logger.info(f"Epoch {epoch}/{hps.train.epochs}")
             train_and_evaluate(
                 rank,
                 epoch,
