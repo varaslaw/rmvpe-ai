@@ -93,11 +93,10 @@ def main():
     for i in range(n_gpus):
         children[i].join()
 
-
 def run(rank, n_gpus, hps):
     global global_step
     if rank == 0:
-        logger = utils.get_logger(hps.model_dir)
+        logger = utils.get_logger(hps.model_dir, rank)  # Modify this line
         logger.info(hps)
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
@@ -107,7 +106,8 @@ def run(rank, n_gpus, hps):
     dist.init_process_group(
         backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
     )
-    torch.manual_seed(hps.train.seed)
+    torch.manual_seed
+
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
