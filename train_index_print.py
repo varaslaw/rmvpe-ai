@@ -6,6 +6,12 @@ import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 from multiprocessing import cpu_count
 
+try:
+    from fairseq import checkpoint_utils
+except ImportError:
+    print("Библиотека fairseq не найдена. Пожалуйста, установите ее перед запуском скрипта.")
+    sys.exit(1)
+
 # Example: 
 #       python3 train_index_print.py mi-test v2
 
