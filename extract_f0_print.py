@@ -55,6 +55,8 @@ class FeatureInput(object):
     def compute_f0(self, path, f0_method):
         x = load_audio(path, self.fs)
         p_len = x.shape[0] // self.hop
+        f0 = None  # Initialize f0 as None
+
         if f0_method == "pm":
             time_step = 160 / 16000 * 1000
             f0_min = 50
@@ -71,9 +73,7 @@ class FeatureInput(object):
             )
             pad_size = (p_len - len(f0) + 1) // 2
             if pad_size > 0 or p_len - len(f0) - pad_size > 0:
-                f0 = np.pad(
-                    f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
-                )
+                f0 = np.pad(f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant")
         elif f0_method == "harvest":
             f0, t = pyworld.harvest(
                 x.astype(np.double),
@@ -100,6 +100,10 @@ class FeatureInput(object):
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         elif f0_method == "rmvpe+":
             f0 = self.compute_f0_rmvpe_plus(x)
+
+        if f0 is None:  # Check if f0 is still None
+            raise ValueError(f"Unsupported F0 extraction method: {f0_method}")
+
         return f0
 
     def compute_f0_rmvpe_plus(self, audio):
