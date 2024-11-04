@@ -57,52 +57,55 @@ class FeatureInput(object):
         p_len = x.shape[0] // self.hop
         f0 = None  # Initialize f0 as None
 
-        if f0_method == "pm":
-            time_step = 160 / 16000 * 1000
-            f0_min = 50
-            f0_max = 1100
-            f0 = (
-                parselmouth.Sound(x, self.fs)
-                .to_pitch_ac(
-                    time_step=time_step / 1000,
-                    voicing_threshold=0.6,
-                    pitch_floor=f0_min,
-                    pitch_ceiling=f0_max,
+        try:
+            if f0_method == "pm":
+                time_step = 160 / 16000 * 1000
+                f0_min = 50
+                f0_max = 1100
+                f0 = (
+                    parselmouth.Sound(x, self.fs)
+                    .to_pitch_ac(
+                        time_step=time_step / 1000,
+                        voicing_threshold=0.6,
+                        pitch_floor=f0_min,
+                        pitch_ceiling=f0_max,
+                    )
+                    .selected_array["frequency"]
                 )
-                .selected_array["frequency"]
-            )
-            pad_size = (p_len - len(f0) + 1) // 2
-            if pad_size > 0 or p_len - len(f0) - pad_size > 0:
-                f0 = np.pad(f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant")
-        elif f0_method == "harvest":
-            f0, t = pyworld.harvest(
-                x.astype(np.double),
-                fs=self.fs,
-                f0_ceil=self.f0_max,
-                f0_floor=self.f0_min,
-                frame_period=1000 * self.hop / self.fs,
-            )
-            f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
-        elif f0_method == "dio":
-            f0, t = pyworld.dio(
-                x.astype(np.double),
-                fs=self.fs,
-                f0_ceil=self.f0_max,
-                f0_floor=self.f0_min,
-                frame_period=1000 * self.hop / self.fs,
-            )
-            f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
-        elif f0_method == "rmvpe":
-            if not hasattr(self, "model_rmvpe"):
-                from lib.rmvpe import RMVPE
-                print("loading rmvpe model")
-                self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
-            f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        elif f0_method == "rmvpe+":
-            f0 = self.compute_f0_rmvpe_plus(x)
+                pad_size = (p_len - len(f0) + 1) // 2
+                if pad_size > 0 or p_len - len(f0) - pad_size > 0:
+                    f0 = np.pad(f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant")
+            elif f0_method == "harvest":
+                f0, t = pyworld.harvest(
+                    x.astype(np.double),
+                    fs=self.fs,
+                    f0_ceil=self.f0_max,
+                    f0_floor=self.f0_min,
+                    frame_period=1000 * self.hop / self.fs,
+                )
+                f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
+            elif f0_method == "dio":
+                f0, t = pyworld.dio(
+                    x.astype(np.double),
+                    fs=self.fs,
+                    f0_ceil=self.f0_max,
+                    f0_floor=self.f0_min,
+                    frame_period=1000 * self.hop / self.fs,
+                )
+                f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
+            elif f0_method == "rmvpe":
+                if not hasattr(self, "model_rmvpe"):
+                    from lib.rmvpe import RMVPE
+                    print("loading rmvpe model")
+                    self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
+                f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+            elif f0_method == "rmvpe+":
+                f0 = self.compute_f0_rmvpe_plus(x)
+        except Exception as e:
+            printt(f"Error in F0 computation: {str(e)}")
 
         if f0 is None:  # Check if f0 is still None
-            raise ValueError(f"Unsupported F0 extraction method: {f0_method}")
+            raise ValueError(f"Unsupported or failed F0 extraction method: {f0_method}")
 
         return f0
 
@@ -112,7 +115,6 @@ class FeatureInput(object):
             print("loading rmvpe model")
             self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
 
-        # RMVPE F0 extraction
         f0 = self.model_rmvpe.infer_from_audio(audio, thred=0.03)
 
         # Apply RNN smoothing for better F0 continuity
@@ -140,13 +142,11 @@ class FeatureInput(object):
 
     def noise_reduction(self, audio):
         # Placeholder for improved noise reduction logic
-        # Use spectral techniques to suppress sibilance
         denoised_audio = audio  # Implement actual noise reduction here
         return denoised_audio
 
     def pronunciation_correction(self, audio):
         # Adjust specific frequency bands to improve consonant clarity
-        # Target problematic phonemes like "s" and "r" for correction
         corrected_audio = audio  # Implement frequency adjustments here
         return corrected_audio
 
@@ -191,7 +191,7 @@ class FeatureInput(object):
                     np.save(opt_path2, featur_pit, allow_pickle=False)
                     coarse_pit = self.coarse_f0(featur_pit)
                     np.save(opt_path1, coarse_pit, allow_pickle=False)
-                except:
+                except Exception as e:
                     printt("f0fail-%s-%s-%s" % (idx, inp_path, traceback.format_exc()))
 
 if __name__ == "__main__":
