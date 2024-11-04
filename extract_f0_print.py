@@ -12,16 +12,13 @@ from multiprocessing import Process
 exp_dir = sys.argv[1]
 f = open("%s/extract_f0_feature.log" % exp_dir, "a+")
 
-
 def printt(strr):
     print(strr)
     f.write("%s\n" % strr)
     f.flush()
 
-
 n_p = int(sys.argv[2])
 f0method = sys.argv[3]
-
 
 class FeatureInput(object):
     def __init__(self, samplerate=16000, hop_size=160):
@@ -75,12 +72,17 @@ class FeatureInput(object):
             )
             f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
         elif f0_method == "rmvpe":
-            if hasattr(self, "model_rmvpe") == False:
+            if not hasattr(self, "model_rmvpe"):
                 from lib.rmvpe import RMVPE
-
                 print("loading rmvpe model")
                 self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+        elif f0_method == "rmvpe+":
+            if not hasattr(self, "model_rmvpe_plus"):
+                from lib.rmvpe import RMVPE
+                print("loading rmvpe+ model")
+                self.model_rmvpe_plus = RMVPE("rmvpe_plus.pt", is_half=True, device="cuda")
+            f0 = self.model_rmvpe_plus.infer_from_audio(x, thred=0.02)
         return f0
 
     def coarse_f0(self, f0):
@@ -88,10 +90,7 @@ class FeatureInput(object):
         f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * (
             self.f0_bin - 2
         ) / (self.f0_mel_max - self.f0_mel_min) + 1
-
-        # use 0 or 1
-        f0_mel[f0_mel <= 1] = 1
-        f0_mel[f0_mel > self.f0_bin - 1] = self.f0_bin - 1
+        f0_mel = np.clip(f0_mel, 1, self.f0_bin - 1)
         f0_coarse = np.rint(f0_mel).astype(int)
         assert f0_coarse.max() <= 255 and f0_coarse.min() >= 1, (
             f0_coarse.max(),
@@ -104,49 +103,34 @@ class FeatureInput(object):
             printt("no-f0-todo")
         else:
             printt("todo-f0-%s" % len(paths))
-            n = max(len(paths) // 5, 1)  # 每个进程最多打印5条
+            n = max(len(paths) // 5, 1)
             for idx, (inp_path, opt_path1, opt_path2) in enumerate(paths):
                 try:
                     if idx % n == 0:
                         printt("f0ing,now-%s,all-%s,-%s" % (idx, len(paths), inp_path))
-                    if (
-                        os.path.exists(opt_path1 + ".npy") == True
-                        and os.path.exists(opt_path2 + ".npy") == True
-                    ):
+                    if os.path.exists(opt_path1 + ".npy") and os.path.exists(opt_path2 + ".npy"):
                         continue
                     featur_pit = self.compute_f0(inp_path, f0_method)
-                    np.save(
-                        opt_path2,
-                        featur_pit,
-                        allow_pickle=False,
-                    )  # nsf
+                    np.save(opt_path2, featur_pit, allow_pickle=False)
                     coarse_pit = self.coarse_f0(featur_pit)
-                    np.save(
-                        opt_path1,
-                        coarse_pit,
-                        allow_pickle=False,
-                    )  # ori
+                    np.save(opt_path1, coarse_pit, allow_pickle=False)
                 except:
                     printt("f0fail-%s-%s-%s" % (idx, inp_path, traceback.format_exc()))
 
-
 if __name__ == "__main__":
-    # exp_dir=r"E:\codes\py39\dataset\mi-test"
-    # n_p=16
-    # f = open("%s/log_extract_f0.log"%exp_dir, "w")
     printt(sys.argv)
     featureInput = FeatureInput()
     paths = []
-    inp_root = "%s/1_16k_wavs" % (exp_dir)
-    opt_root1 = "%s/2a_f0" % (exp_dir)
-    opt_root2 = "%s/2b-f0nsf" % (exp_dir)
+    inp_root = "%s/1_16k_wavs" % exp_dir
+    opt_root1 = "%s/2a_f0" % exp_dir
+    opt_root2 = "%s/2b-f0nsf" % exp_dir
 
     os.makedirs(opt_root1, exist_ok=True)
     os.makedirs(opt_root2, exist_ok=True)
-    for name in sorted(list(os.listdir(inp_root))):
-        inp_path = "%s/%s" % (inp_root, name)
-        if "spec" in inp_path:
+    for name in sorted(os.listdir(inp_root)):
+        if "spec" in name:
             continue
+        inp_path = "%s/%s" % (inp_root, name)
         opt_path1 = "%s/%s" % (opt_root1, name)
         opt_path2 = "%s/%s" % (opt_root2, name)
         paths.append([inp_path, opt_path1, opt_path2])
@@ -162,5 +146,5 @@ if __name__ == "__main__":
         )
         ps.append(p)
         p.start()
-    for i in range(n_p):
-        ps[i].join()
+    for p in ps:
+        p.join()
