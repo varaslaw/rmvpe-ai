@@ -1,24 +1,27 @@
 import os, traceback, sys, parselmouth
+import numpy as np, logging
+import pyworld
+from multiprocessing import Process
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 from lib.audio import load_audio
-import pyworld
-import numpy as np, logging
 
 logging.getLogger("numba").setLevel(logging.WARNING)
-from multiprocessing import Process
 
 exp_dir = sys.argv[1]
 f = open("%s/extract_f0_feature.log" % exp_dir, "a+")
+
 
 def printt(strr):
     print(strr)
     f.write("%s\n" % strr)
     f.flush()
 
+
 n_p = int(sys.argv[2])
 f0method = sys.argv[3]
+
 
 class FeatureInput(object):
     def __init__(self, samplerate=16000, hop_size=160):
@@ -78,13 +81,25 @@ class FeatureInput(object):
                 self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         elif f0_method == "rmvpe+":
-            if not hasattr(self, "model_rmvpe_plus"):
-                from lib.rmvpe import RMVPE
-                print("loading rmvpe+ model")
-                # Используем ту же модель rmvpe.pt, но с улучшенными параметрами
-                self.model_rmvpe_plus = RMVPE("rmvpe.pt", is_half=False, device="cpu")
-            f0 = self.model_rmvpe_plus.infer_from_audio(x, thred=0.02)  # Пример улучшенного порога
+            f0 = self.compute_f0_rmvpe_plus(x)
         return f0
+
+    def compute_f0_rmvpe_plus(self, audio):
+        if not hasattr(self, "model_rmvpe"):
+            from lib.rmvpe import RMVPE
+            print("loading rmvpe model")
+            self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
+
+        # Extract F0 using RMVPE model
+        f0 = self.model_rmvpe.infer_from_audio(audio, thred=0.03)
+        # Apply smoothing to reduce artifacts
+        f0 = self.smooth_f0(f0)
+        return f0
+
+    def smooth_f0(self, f0):
+        # Simple smoothing filter using moving average
+        window_size = 5
+        return np.convolve(f0, np.ones(window_size) / window_size, mode="same")
 
     def coarse_f0(self, f0):
         f0_mel = 1127 * np.log(1 + f0 / 700)
@@ -107,7 +122,7 @@ class FeatureInput(object):
             printt("no-f0-todo")
         else:
             printt("todo-f0-%s" % len(paths))
-            n = max(len(paths) // 5, 1)  # Каждый процесс обрабатывает максимум 5 элементов
+            n = max(len(paths) // 5, 1)  # 每个进程最多打印5条
             for idx, (inp_path, opt_path1, opt_path2) in enumerate(paths):
                 try:
                     if idx % n == 0:
@@ -123,6 +138,7 @@ class FeatureInput(object):
                     np.save(opt_path1, coarse_pit, allow_pickle=False)  # ori
                 except:
                     printt("f0fail-%s-%s-%s" % (idx, inp_path, traceback.format_exc()))
+
 
 if __name__ == "__main__":
     printt(sys.argv)
