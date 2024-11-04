@@ -71,18 +71,16 @@ class FeatureInput(object):
                 frame_period=1000 * self.hop / self.fs,
             )
             f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
-        elif f0_method == "rmvpe":
+        elif f0_method in ["rmvpe", "rmvpe+"]:
             if not hasattr(self, "model_rmvpe"):
                 from lib.rmvpe import RMVPE
                 print("loading rmvpe model")
                 self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
-            f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        elif f0_method == "rmvpe+":
-            if not hasattr(self, "model_rmvpe_plus"):
-                from lib.rmvpe import RMVPE
-                print("loading rmvpe+ model")
-                self.model_rmvpe_plus = RMVPE("rmvpe_plus.pt", is_half=True, device="cuda")
-            f0 = self.model_rmvpe_plus.infer_from_audio(x, thred=0.02)
+            if f0_method == "rmvpe+":
+                print("using enhanced RMVPE+ settings")
+                f0 = self.model_rmvpe.infer_from_audio(x, thred=0.02)  # Lower threshold for more sensitivity
+            else:
+                f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)  # Standard threshold
         return f0
 
     def coarse_f0(self, f0):
@@ -139,10 +137,7 @@ if __name__ == "__main__":
     for i in range(n_p):
         p = Process(
             target=featureInput.go,
-            args=(
-                paths[i::n_p],
-                f0method,
-            ),
+            args=(paths[i::n_p], f0method),
         )
         ps.append(p)
         p.start()
