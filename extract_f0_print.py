@@ -1,10 +1,14 @@
-import os, traceback, sys, parselmouth
-import numpy as np, logging
+import os
+import traceback
+import sys
+import parselmouth
+import numpy as np
+import logging
 import pyworld
-from multiprocessing import Process
 import torch
 import torch.nn as nn
 import scipy.signal as signal
+from multiprocessing import Process, Queue
 from datetime import datetime
 
 now_dir = os.getcwd()
@@ -16,67 +20,85 @@ logging.getLogger("numba").setLevel(logging.WARNING)
 exp_dir = sys.argv[1]
 f = open("%s/extract_f0_feature.log" % exp_dir, "a+")
 
-def printt(strr):
-    """Logging function for both console and file output"""
-    print(strr)
-    f.write("%s\n" % strr)
+def printt(message):
+    """Logging function with timestamp for both console and file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_message = f"[{timestamp}] {message}"
+    print(log_message)
+    f.write(f"{log_message}\n")
     f.flush()
 
 n_p = int(sys.argv[2])
 f0method = sys.argv[3]
 
-class F0Preprocessor:
-    """Advanced F0 preprocessing and enhancement class"""
-    def __init__(self, window_length=64, alpha=0.3):
-        self.window_length = window_length
-        self.alpha = alpha
+class EnhancedF0Processor:
+    """Advanced F0 processing with multiple enhancement techniques"""
+    def __init__(self, hop_length=160):
+        self.hop_length = hop_length
+        self.f0_statistics = {'mean': None, 'std': None}
         
-    def median_smoothing(self, f0, window_length=None):
-        """Apply median smoothing to F0 contour"""
-        if window_length is None:
-            window_length = self.window_length
-        return signal.medfilt(f0, kernel_size=window_length)
+    def remove_outliers(self, f0, threshold=2.5):
+        """Remove statistical outliers from F0 contour"""
+        f0_voiced = f0[f0 > 0]
+        if len(f0_voiced) > 0:
+            mean = np.mean(f0_voiced)
+            std = np.std(f0_voiced)
+            threshold_up = mean + threshold * std
+            threshold_down = mean - threshold * std
+            f0_clean = np.where((f0 > threshold_down) & (f0 < threshold_up), f0, 0)
+            return f0_clean
+        return f0
 
-    def adaptive_smoothing(self, f0, threshold=0.1):
-        """Apply adaptive smoothing based on F0 variations"""
-        smooth_f0 = np.copy(f0)
-        diff = np.abs(np.diff(f0))
-        mask = diff > (diff.mean() + threshold * diff.std())
-        for i in range(1, len(f0)-1):
-            if mask[i-1] or mask[i]:
-                smooth_f0[i] = np.mean(f0[max(0,i-2):min(len(f0),i+3)])
-        return smooth_f0
-
-    def interpolate_zeros(self, f0):
-        """Interpolate zero values in F0 contour"""
-        nzindex = np.nonzero(f0)[0]
-        if len(nzindex) == 0:
+    def adaptive_smoothing(self, f0, window_range=(3, 7)):
+        """Apply adaptive window smoothing based on F0 stability"""
+        if len(f0) == 0:
             return f0
-        f0_interp = np.interp(np.arange(len(f0)), nzindex, f0[nzindex])
-        return f0_interp
-
-class RNNSmoother(nn.Module):
-    """RNN-based F0 smoother for advanced contour processing"""
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.1):
-        super(RNNSmoother, self).__init__()
-        self.rnn = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            batch_first=True,
-            bidirectional=True
-        )
-        self.fc = nn.Linear(hidden_size * 2, 1)
+            
+        f0_diff = np.abs(np.diff(f0))
+        window_size = int(np.mean(f0_diff) * (window_range[1] - window_range[0]) + window_range[0])
+        window_size = window_size if window_size % 2 == 1 else window_size + 1
         
-    def forward(self, x):
-        x, _ = self.rnn(x)
-        return self.fc(x)
+        return signal.medfilt(f0, kernel_size=min(window_size, len(f0)))
+
+    def interpolate_gaps(self, f0, max_gap_size=20):
+        """Interpolate small gaps in F0 contour"""
+        if len(f0) == 0:
+            return f0
+            
+        f0_interpolated = f0.copy()
+        zero_regions = np.where(f0_interpolated == 0)[0]
+        
+        if len(zero_regions) == 0:
+            return f0_interpolated
+            
+        # Find continuous zero regions
+        gaps = np.split(zero_regions, np.where(np.diff(zero_regions) != 1)[0] + 1)
+        
+        for gap in gaps:
+            if len(gap) > max_gap_size:
+                continue
+                
+            start_idx = max(0, gap[0] - 1)
+            end_idx = min(len(f0), gap[-1] + 2)
+            
+            if start_idx == 0 or end_idx == len(f0):
+                continue
+                
+            start_val = f0[start_idx]
+            end_val = f0[end_idx]
+            
+            if start_val == 0 or end_val == 0:
+                continue
+                
+            interpolated_values = np.linspace(start_val, end_val, len(gap) + 2)[1:-1]
+            f0_interpolated[gap] = interpolated_values
+            
+        return f0_interpolated
 
 class FeatureInput:
-    """Main feature extraction class with improved F0 processing"""
-    def __init__(self, samplerate=16000, hop_size=160):
-        self.fs = samplerate
+    """Main feature extraction class with improved RMVPE+ implementation"""
+    def __init__(self, sample_rate=16000, hop_size=160):
+        self.fs = sample_rate
         self.hop = hop_size
         
         # F0 extraction parameters
@@ -85,53 +107,65 @@ class FeatureInput:
         self.f0_min = 50.0
         self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
-
-        # Initialize processors
-        self.f0_preprocessor = F0Preprocessor()
-        self.rnn_smoother = RNNSmoother()
         
-        # Load RNN model if exists
-        model_path = "rnn_smoother.pth"
-        if os.path.exists(model_path):
+        # Initialize enhanced F0 processor
+        self.f0_processor = EnhancedF0Processor(hop_size)
+        
+        # RMVPE model loading status
+        self.rmvpe_loaded = False
+        
+    def load_rmvpe(self):
+        """Load RMVPE model with error handling"""
+        if not self.rmvpe_loaded:
             try:
-                self.rnn_smoother.load_state_dict(torch.load(model_path))
-                self.rnn_smoother.eval()
+                from lib.rmvpe import RMVPE
+                printt("Loading RMVPE model...")
+                self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
+                self.rmvpe_loaded = True
             except Exception as e:
-                printt(f"Failed to load RNN model: {str(e)}")
-
-    def enhance_f0(self, f0):
-        """Enhanced F0 processing pipeline"""
-        # Remove zeros and interpolate
-        f0 = self.f0_preprocessor.interpolate_zeros(f0)
-        
-        # Apply median smoothing
-        f0 = self.f0_preprocessor.median_smoothing(f0)
-        
-        # Apply adaptive smoothing
-        f0 = self.f0_preprocessor.adaptive_smoothing(f0)
-        
-        # Apply RNN smoothing if model is available
-        try:
-            with torch.no_grad():
-                f0_tensor = torch.FloatTensor(f0).view(-1, 1, 1)
-                f0_smooth = self.rnn_smoother(f0_tensor)
-                f0 = f0_smooth.squeeze().numpy()
-        except Exception as e:
-            printt(f"RNN smoothing skipped: {str(e)}")
-        
-        return f0
+                printt(f"Failed to load RMVPE model: {str(e)}")
+                raise
 
     def compute_f0(self, path, f0_method):
-        """Compute F0 with specified method and apply enhancements"""
+        """Enhanced F0 computation with multiple methods and improved processing"""
         x = load_audio(path, self.fs)
         p_len = x.shape[0] // self.hop
-        
-        # Initialize f0 as None
+
         f0 = None
-        
+        error_msgs = []
+
         try:
-            if f0_method == "pm":
-                # Praat-based F0 extraction
+            if f0_method in ["rmvpe", "rmvpe+"]:
+                self.load_rmvpe()
+                f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+
+                if f0_method == "rmvpe+":
+                    # Enhanced processing pipeline
+                    f0 = self.f0_processor.remove_outliers(f0)
+                    f0 = self.f0_processor.interpolate_gaps(f0)
+                    f0 = self.f0_processor.adaptive_smoothing(f0)
+
+            elif f0_method == "harvest":
+                f0, t = pyworld.harvest(
+                    x.astype(np.double),
+                    fs=self.fs,
+                    f0_ceil=self.f0_max,
+                    f0_floor=self.f0_min,
+                    frame_period=1000 * self.hop / self.fs,
+                )
+                f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
+
+            elif f0_method == "dio":
+                f0, t = pyworld.dio(
+                    x.astype(np.double),
+                    fs=self.fs,
+                    f0_ceil=self.f0_max,
+                    f0_floor=self.f0_min,
+                    frame_period=1000 * self.hop / self.fs,
+                )
+                f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
+
+            elif f0_method == "pm":
                 time_step = 160 / 16000 * 1000
                 f0 = (
                     parselmouth.Sound(x, self.fs)
@@ -143,65 +177,35 @@ class FeatureInput:
                     )
                     .selected_array["frequency"]
                 )
+
+                # Pad if necessary
                 pad_size = (p_len - len(f0) + 1) // 2
                 if pad_size > 0 or p_len - len(f0) - pad_size > 0:
                     f0 = np.pad(f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant")
 
-            elif f0_method == "harvest":
-                # WORLD Harvest F0 extraction
-                f0, t = pyworld.harvest(
-                    x.astype(np.double),
-                    fs=self.fs,
-                    f0_ceil=self.f0_max,
-                    f0_floor=self.f0_min,
-                    frame_period=1000 * self.hop / self.fs,
-                )
-                f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
-
-            elif f0_method == "dio":
-                # WORLD DIO F0 extraction
-                f0, t = pyworld.dio(
-                    x.astype(np.double),
-                    fs=self.fs,
-                    f0_ceil=self.f0_max,
-                    f0_floor=self.f0_min,
-                    frame_period=1000 * self.hop / self.fs,
-                )
-                f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
-
-            elif f0_method == "rmvpe":
-                # RMVPE-based F0 extraction
-                if not hasattr(self, "model_rmvpe"):
-                    from lib.rmvpe import RMVPE
-                    printt("Loading RMVPE model")
-                    self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
-                f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-
-            elif f0_method == "rmvpe+":
-                # Enhanced RMVPE with additional processing
-                if not hasattr(self, "model_rmvpe"):
-                    from lib.rmvpe import RMVPE
-                    printt("Loading RMVPE model")
-                    self.model_rmvpe = RMVPE("rmvpe.pt", is_half=False, device="cpu")
-                
-                # Get base F0
-                f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-                
-                # Apply enhanced processing
-                if f0 is not None:
-                    f0 = self.enhance_f0(f0)
-
         except Exception as e:
-            printt(f"Error in F0 computation: {str(e)}\n{traceback.format_exc()}")
-            raise
+            error_msg = f"Error in F0 extraction ({f0_method}): {str(e)}"
+            error_msgs.append(error_msg)
+            printt(error_msg)
 
-        if f0 is None:
-            raise ValueError(f"F0 extraction failed for method: {f0_method}")
+        # Validate F0 output
+        if f0 is None or len(f0) == 0:
+            raise ValueError(f"F0 extraction failed. Errors: {'; '.join(error_msgs)}")
+
+        if len(f0) != p_len:
+            f0 = np.interp(
+                np.linspace(0, len(f0)-1, p_len),
+                np.arange(len(f0)),
+                f0
+            )
 
         return f0
 
     def coarse_f0(self, f0):
-        """Convert F0 to coarse-grained representation"""
+        """Convert F0 to coarse-grained representation with validation"""
+        if f0 is None or len(f0) == 0:
+            raise ValueError("Invalid F0 input for coarse conversion")
+
         # Mel-scale conversion
         f0_mel = 1127 * np.log(1 + f0 / 700)
         
@@ -218,72 +222,95 @@ class FeatureInput:
         f0_coarse = np.rint(f0_mel).astype(int)
         
         # Verify range
-        assert f0_coarse.max() <= 255 and f0_coarse.min() >= 1, (
-            f0_coarse.max(),
-            f0_coarse.min(),
-        )
+        if f0_coarse.max() > 255 or f0_coarse.min() < 1:
+            raise ValueError(f"F0 coarse values out of range: min={f0_coarse.min()}, max={f0_coarse.max()}")
         
         return f0_coarse
 
     def go(self, paths, f0_method):
-        """Process multiple files with F0 extraction"""
+        """Process multiple files with enhanced error handling and progress tracking"""
         if len(paths) == 0:
             printt("no-f0-todo")
             return
 
-        printt(f"todo-f0-{len(paths)}")
+        printt(f"Starting F0 extraction for {len(paths)} files using {f0_method}")
         n = max(len(paths) // 5, 1)
         
         for idx, (inp_path, opt_path1, opt_path2) in enumerate(paths):
             try:
                 if idx % n == 0:
-                    printt(f"f0ing,now-{idx},all-{len(paths)},-{inp_path}")
+                    printt(f"Progress: {idx}/{len(paths)} ({idx/len(paths)*100:.1f}%) - {inp_path}")
                 
                 # Skip if already processed
                 if os.path.exists(opt_path1 + ".npy") and os.path.exists(opt_path2 + ".npy"):
                     continue
                 
+                # Validate input file
+                if not os.path.exists(inp_path):
+                    printt(f"Input file not found: {inp_path}")
+                    continue
+                    
+                if os.path.getsize(inp_path) == 0:
+                    printt(f"Empty input file: {inp_path}")
+                    continue
+
                 # Extract and process F0
                 featur_pit = self.compute_f0(inp_path, f0_method)
                 
+                # Validate output
+                if featur_pit is None or len(featur_pit) == 0:
+                    printt(f"Invalid F0 output for {inp_path}")
+                    continue
+
                 # Save results
                 np.save(opt_path2, featur_pit, allow_pickle=False)
                 coarse_pit = self.coarse_f0(featur_pit)
                 np.save(opt_path1, coarse_pit, allow_pickle=False)
-                
+
             except Exception as e:
-                printt(f"f0fail-{idx}-{inp_path}-{traceback.format_exc()}")
+                printt(f"Failed to process {inp_path}: {str(e)}\n{traceback.format_exc()}")
+                continue
+
+        printt(f"F0 extraction completed for {len(paths)} files")
 
 if __name__ == "__main__":
-    printt(sys.argv)
-    featureInput = FeatureInput()
+    printt(f"Starting F0 extraction with arguments: {sys.argv}")
     
-    # Setup paths
-    paths = []
-    inp_root = "%s/1_16k_wavs" % (exp_dir)
-    opt_root1 = "%s/2a_f0" % (exp_dir)
-    opt_root2 = "%s/2b-f0nsf" % (exp_dir)
+    try:
+        feature_input = FeatureInput()
+        
+        # Setup paths
+        paths = []
+        inp_root = "%s/1_16k_wavs" % (exp_dir)
+        opt_root1 = "%s/2a_f0" % (exp_dir)
+        opt_root2 = "%s/2b-f0nsf" % (exp_dir)
 
-    # Create output directories
-    os.makedirs(opt_root1, exist_ok=True)
-    os.makedirs(opt_root2, exist_ok=True)
-    
-    # Collect files for processing
-    for name in sorted(os.listdir(inp_root)):
-        if "spec" in name:
-            continue
-        inp_path = "%s/%s" % (inp_root, name)
-        opt_path1 = "%s/%s" % (opt_root1, name)
-        opt_path2 = "%s/%s" % (opt_root2, name)
-        paths.append([inp_path, opt_path1, opt_path2])
+        # Create output directories
+        os.makedirs(opt_root1, exist_ok=True)
+        os.makedirs(opt_root2, exist_ok=True)
+        
+        # Collect files for processing
+        for name in sorted(os.listdir(inp_root)):
+            if "spec" in name:
+                continue
+            inp_path = "%s/%s" % (inp_root, name)
+            opt_path1 = "%s/%s" % (opt_root1, name)
+            opt_path2 = "%s/%s" % (opt_root2, name)
+            paths.append([inp_path, opt_path1, opt_path2])
 
-    # Process files in parallel
-    ps = []
-    for i in range(n_p):
-        p = Process(target=featureInput.go, args=(paths[i::n_p], f0method))
-        ps.append(p)
-        p.start()
-    
-    # Wait for completion
-    for i in range(n_p):
-        ps[i].join()
+        # Process files in parallel
+        processes = []
+        for i in range(n_p):
+            p = Process(target=feature_input.go, args=(paths[i::n_p], f0method))
+            processes.append(p)
+            p.start()
+        
+        # Wait for completion
+        for p in processes:
+            p.join()
+
+        printt("F0 extraction completed successfully")
+
+    except Exception as e:
+        printt(f"Fatal error in F0 extraction: {str(e)}\n{traceback.format_exc()}")
+        sys.exit(1)
