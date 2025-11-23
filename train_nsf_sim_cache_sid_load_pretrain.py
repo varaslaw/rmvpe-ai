@@ -37,15 +37,19 @@ from lib.train.data_utils import (
 )
 
 # ============================================================
-# 🔥 КРУТЫЕ ЛОГИ - ИНТЕГРАЦИЯ TENSORBOARD LOGGER
+# TENSORBOARD LOGGER - GRACEFUL FALLBACK
 # ============================================================
+TENSORBOARD_LOGGER_AVAILABLE = False
 try:
     from utils.tensorboard_logger import TensorBoardMetricsTracker
     TENSORBOARD_LOGGER_AVAILABLE = True
+    print("✅ TensorBoard Logger loaded successfully!")
 except ImportError:
-    print("⚠️  utils/tensorboard_logger.py не найден!")
-    print("   Крутые логи будут недоступны")
-    TENSORBOARD_LOGGER_AVAILABLE = False
+    print("⚠️  utils/tensorboard_logger.py not found")
+    print("   Standard logs will be used")
+except Exception as e:
+    print(f"⚠️  TensorBoard Logger error: {e}")
+    print("   Standard logs will be used")
 # ============================================================
 
 if hps.version == "v1":
@@ -122,19 +126,18 @@ def run(rank, n_gpus, hps):
         torch.cuda.set_device(rank)
 
     # ============================================================
-    # ИНИЦИАЛИЗАЦИЯ TENSORBOARD LOGGER
+    # INITIALIZE TENSORBOARD LOGGER IF AVAILABLE
     # ============================================================
     if rank == 0 and TENSORBOARD_LOGGER_AVAILABLE:
         try:
             metrics_tracker = TensorBoardMetricsTracker(log_dir=hps.model_dir)
-            logger.info("✅ TensorBoard Logger инициализирован!")
-            logger.info("   Крутые логи будут доступны во время обучения")
+            logger.info("✅ TensorBoard Metrics Tracker initialized")
         except Exception as e:
-            logger.info(f"⚠️  Ошибка инициализации TensorBoard Logger: {e}")
+            logger.info(f"⚠️  Metrics tracker error: {e}")
             metrics_tracker = None
     # ============================================================
 
-    # Dataset setup
+    # Dataset
     if hps.if_f0 == 1:
         train_dataset = TextAudioLoaderMultiNSFsid(hps.data.training_files, hps.data)
     else:
@@ -165,7 +168,7 @@ def run(rank, n_gpus, hps):
         prefetch_factor=8,
     )
 
-    # Model initialization
+    # Models
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
             hps.data.filter_length // 2 + 1,
@@ -305,7 +308,7 @@ def train_and_evaluate(
     net_g.train()
     net_d.train()
 
-    # Cache data preparation
+    # Cache preparation
     if hps.if_cache_data_in_gpu == True:
         data_iterator = cache
         if cache == []:
@@ -338,7 +341,7 @@ def train_and_evaluate(
 
     epoch_recorder = EpochRecorder()
 
-    # Training batch loop
+    # Training loop
     for batch_idx, info in data_iterator:
         if hps.if_f0 == 1:
             phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, wave_lengths, sid = info
@@ -431,13 +434,13 @@ def train_and_evaluate(
             scaler.update()
 
             # ============================================================
-            # 🔥 КРУТЫЕ ЛОГИ - ВЫВОД В СТИЛЕ СКРИНА
+            # ENHANCED LOGGING
             # ============================================================
             if rank == 0:
                 if global_step % hps.train.log_interval == 0:
                     lr = optim_g.param_groups[0]["lr"]
 
-                    # Стандартные логи
+                    # Standard logs
                     logger.info(
                         "Train Epoch: {} [{:.0f}%]".format(
                             epoch, 100.0 * batch_idx / len(train_loader)
@@ -456,20 +459,19 @@ def train_and_evaluate(
                     )
 
                     # ============================================================
-                    # КРУТЫЕ ЛОГИ С TENSORBOARD
+                    # ENHANCED METRICS FROM TENSORBOARD (IF AVAILABLE)
                     # ============================================================
                     if metrics_tracker is not None:
                         try:
                             current_mel = float(loss_mel.detach().cpu().item())
-                            current_total = float(loss_gen_all.detach().cpu().item())
 
-                            # Получаем лучшую эпоху из TensorBoard
+                            # Get best epoch from TensorBoard
                             best_epoch, best_mel = metrics_tracker.find_best_epoch("loss/g/mel")
 
                             if best_epoch is None or best_mel is None:
                                 best_epoch, best_mel = epoch, current_mel
 
-                            # Проверка перетренировки
+                            # Check overtraining
                             patience = getattr(hps.train, "overtrain_patience", 20)
                             is_overtraining = metrics_tracker.check_overtraining(
                                 current_epoch=epoch,
@@ -477,25 +479,25 @@ def train_and_evaluate(
                                 patience=patience,
                             )
 
-                            # ВЫВОД В СТИЛЕ СКРИНА
+                            # PRINT IN STYLE OF YOUR SCREENSHOT
                             logger.info("="*70)
                             logger.info(
-                                f"[{epoch_recorder.record()}]: Model ▶ Эпоха {epoch}/{hps.train.epochs} "
-                                f"(Шаг {global_step}) || "
-                                f"Mel: {current_mel*100:.2f}% ▶ Рекорд: {best_mel*100:.2f}% (Эпоха {best_epoch})"
+                                f"{epoch_recorder.record()}: Model ▶ Epoch {epoch}/{hps.train.epochs} "
+                                f"(Step {global_step}) || "
+                                f"Mel: {current_mel*100:.2f}% ▶ Record: {best_mel*100:.2f}% (Epoch {best_epoch})"
                             )
 
                             if is_overtraining:
-                                logger.info(f"⚠️  [Возможна перетренировка] Нет улучшения за {patience} эпох!")
-                                logger.info(f"   Лучший результат был на эпохе {best_epoch}")
+                                logger.info(f"⚠️  [Possible Overtraining] No improvement for {patience} epochs!")
+                                logger.info(f"   Best result was at epoch {best_epoch}")
 
                             logger.info("="*70)
 
                         except Exception as e:
-                            logger.info(f"⚠️  Ошибка крутых логов: {e}")
+                            logger.info(f"⚠️  Metrics logging error: {e}")
                     # ============================================================
 
-                    # TensorBoard scalar logging
+                    # TensorBoard scalars
                     scalar_dict = {
                         "loss/g/total": loss_gen_all,
                         "loss/d/total": loss_disc,
