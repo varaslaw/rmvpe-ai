@@ -9,12 +9,13 @@ import datetime
 hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
-from random import shuffle, randint
 
+from random import shuffle, randint
 import torch
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = True
+
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -22,9 +23,11 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
+
 from lib.infer_pack import commons
 from time import sleep
 from time import time as ttime
+
 from lib.train.data_utils import (
     TextAudioLoaderMultiNSFsid,
     TextAudioLoader,
@@ -33,9 +36,17 @@ from lib.train.data_utils import (
     DistributedBucketSampler,
 )
 
-# === NEW: Enhanced TensorBoard metrics tracker ===
-from utils.tensorboard_logger import TensorBoardMetricsTracker, format_training_log
-# =================================================
+# ============================================================
+# 🔥 КРУТЫЕ ЛОГИ - ИНТЕГРАЦИЯ TENSORBOARD LOGGER
+# ============================================================
+try:
+    from utils.tensorboard_logger import TensorBoardMetricsTracker
+    TENSORBOARD_LOGGER_AVAILABLE = True
+except ImportError:
+    print("⚠️  utils/tensorboard_logger.py не найден!")
+    print("   Крутые логи будут недоступны")
+    TENSORBOARD_LOGGER_AVAILABLE = False
+# ============================================================
 
 if hps.version == "v1":
     from lib.infer_pack.models import (
@@ -49,14 +60,13 @@ else:
         SynthesizerTrnMs768NSFsid_nono as RVC_Model_nof0,
         MultiPeriodDiscriminatorV2 as MultiPeriodDiscriminator,
     )
+
 from lib.train.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
 from lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from lib.train.process_ckpt import savee
 
 global_step = 0
-# === NEW: Global metrics tracker ===
 metrics_tracker = None
-# ===================================
 
 
 class EpochRecorder:
@@ -74,24 +84,18 @@ class EpochRecorder:
 
 def main():
     n_gpus = torch.cuda.device_count()
-
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
         n_gpus = 1
     if n_gpus < 1:
         print("NO GPU DETECTED: falling back to CPU - this may take a while")
         n_gpus = 1
+
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(randint(20000, 55555))
+
     children = []
     for i in range(n_gpus):
-        subproc = mp.Process(
-            target=run,
-            args=(
-                i,
-                n_gpus,
-                hps,
-            ),
-        )
+        subproc = mp.Process(target=run, args=(i, n_gpus, hps))
         children.append(subproc)
         subproc.start()
 
@@ -112,14 +116,30 @@ def run(rank, n_gpus, hps):
     dist.init_process_group(
         backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
     )
+
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
+    # ============================================================
+    # ИНИЦИАЛИЗАЦИЯ TENSORBOARD LOGGER
+    # ============================================================
+    if rank == 0 and TENSORBOARD_LOGGER_AVAILABLE:
+        try:
+            metrics_tracker = TensorBoardMetricsTracker(log_dir=hps.model_dir)
+            logger.info("✅ TensorBoard Logger инициализирован!")
+            logger.info("   Крутые логи будут доступны во время обучения")
+        except Exception as e:
+            logger.info(f"⚠️  Ошибка инициализации TensorBoard Logger: {e}")
+            metrics_tracker = None
+    # ============================================================
+
+    # Dataset setup
     if hps.if_f0 == 1:
         train_dataset = TextAudioLoaderMultiNSFsid(hps.data.training_files, hps.data)
     else:
         train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
+
     train_sampler = DistributedBucketSampler(
         train_dataset,
         hps.train.batch_size * n_gpus,
@@ -128,10 +148,12 @@ def run(rank, n_gpus, hps):
         rank=rank,
         shuffle=True,
     )
+
     if hps.if_f0 == 1:
         collate_fn = TextAudioCollateMultiNSFsid()
     else:
         collate_fn = TextAudioCollate()
+
     train_loader = DataLoader(
         train_dataset,
         num_workers=4,
@@ -143,11 +165,7 @@ def run(rank, n_gpus, hps):
         prefetch_factor=8,
     )
 
-    # === NEW: Initialize TensorBoard metrics tracker ===
-    if rank == 0:
-        metrics_tracker = TensorBoardMetricsTracker(log_dir=hps.model_dir)
-    # ===================================================
-
+    # Model initialization
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
             hps.data.filter_length // 2 + 1,
@@ -163,11 +181,14 @@ def run(rank, n_gpus, hps):
             **hps.model,
             is_half=hps.train.fp16_run,
         )
+
     if torch.cuda.is_available():
         net_g = net_g.cuda(rank)
+
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm)
     if torch.cuda.is_available():
         net_d = net_d.cuda(rank)
+
     optim_g = torch.optim.AdamW(
         net_g.parameters(),
         hps.train.learning_rate,
@@ -180,6 +201,7 @@ def run(rank, n_gpus, hps):
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
+
     if torch.cuda.is_available():
         net_g = DDP(net_g, device_ids=[rank])
         net_d = DDP(net_d, device_ids=[rank])
@@ -187,12 +209,14 @@ def run(rank, n_gpus, hps):
         net_g = DDP(net_g)
         net_d = DDP(net_d)
 
+    # Load checkpoints
     try:
         _, _, _, epoch_str = utils.load_checkpoint(
             utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d
         )
         if rank == 0:
             logger.info("loaded D")
+
         _, _, _, epoch_str = utils.load_checkpoint(
             utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
         )
@@ -200,6 +224,7 @@ def run(rank, n_gpus, hps):
     except:
         epoch_str = 1
         global_step = 0
+
         if hps.pretrainG != "":
             if rank == 0:
                 logger.info("loaded pretrained %s" % (hps.pretrainG))
@@ -208,6 +233,7 @@ def run(rank, n_gpus, hps):
                     torch.load(hps.pretrainG, map_location="cpu")["model"]
                 )
             )
+
         if hps.pretrainD != "":
             if rank == 0:
                 logger.info("loaded pretrained %s" % (hps.pretrainD))
@@ -225,8 +251,9 @@ def run(rank, n_gpus, hps):
     )
 
     scaler = GradScaler(enabled=hps.train.fp16_run)
-
     cache = []
+
+    # Training loop
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
             train_and_evaluate(
@@ -256,6 +283,7 @@ def run(rank, n_gpus, hps):
                 None,
                 cache,
             )
+
         scheduler_g.step()
         scheduler_d.step()
 
@@ -269,41 +297,24 @@ def train_and_evaluate(
     net_g, net_d = nets
     optim_g, optim_d = optims
     train_loader, eval_loader = loaders
+
     if writers is not None:
         writer, writer_eval = writers
 
     train_loader.batch_sampler.set_epoch(epoch)
-
     net_g.train()
     net_d.train()
 
-    # Prepare data iterator
+    # Cache data preparation
     if hps.if_cache_data_in_gpu == True:
         data_iterator = cache
         if cache == []:
             for batch_idx, info in enumerate(train_loader):
                 if hps.if_f0 == 1:
-                    (
-                        phone,
-                        phone_lengths,
-                        pitch,
-                        pitchf,
-                        spec,
-                        spec_lengths,
-                        wave,
-                        wave_lengths,
-                        sid,
-                    ) = info
+                    phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, wave_lengths, sid = info
                 else:
-                    (
-                        phone,
-                        phone_lengths,
-                        spec,
-                        spec_lengths,
-                        wave,
-                        wave_lengths,
-                        sid,
-                    ) = info
+                    phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
+
                 if torch.cuda.is_available():
                     phone = phone.cuda(rank, non_blocking=True)
                     phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -315,60 +326,25 @@ def train_and_evaluate(
                     spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
                     wave = wave.cuda(rank, non_blocking=True)
                     wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
+
                 if hps.if_f0 == 1:
-                    cache.append(
-                        (
-                            batch_idx,
-                            (
-                                phone,
-                                phone_lengths,
-                                pitch,
-                                pitchf,
-                                spec,
-                                spec_lengths,
-                                wave,
-                                wave_lengths,
-                                sid,
-                            ),
-                        )
-                    )
+                    cache.append((batch_idx, (phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, wave_lengths, sid)))
                 else:
-                    cache.append(
-                        (
-                            batch_idx,
-                            (
-                                phone,
-                                phone_lengths,
-                                spec,
-                                spec_lengths,
-                                wave,
-                                wave_lengths,
-                                sid,
-                            ),
-                        )
-                    )
+                    cache.append((batch_idx, (phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid)))
         else:
             shuffle(cache)
     else:
         data_iterator = enumerate(train_loader)
 
     epoch_recorder = EpochRecorder()
+
+    # Training batch loop
     for batch_idx, info in data_iterator:
         if hps.if_f0 == 1:
-            (
-                phone,
-                phone_lengths,
-                pitch,
-                pitchf,
-                spec,
-                spec_lengths,
-                wave,
-                wave_lengths,
-                sid,
-            ) = info
+            phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, wave_lengths, sid = info
         else:
             phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
-        
+
         if (hps.if_cache_data_in_gpu == False) and torch.cuda.is_available():
             phone = phone.cuda(rank, non_blocking=True)
             phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -380,23 +356,17 @@ def train_and_evaluate(
             spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
             wave = wave.cuda(rank, non_blocking=True)
 
+        # Forward pass
         with autocast(enabled=hps.train.fp16_run):
             if hps.if_f0 == 1:
-                (
-                    y_hat,
-                    ids_slice,
-                    x_mask,
-                    z_mask,
-                    (z, z_p, m_p, logs_p, m_q, logs_q),
-                ) = net_g(phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid)
+                y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(
+                    phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
+                )
             else:
-                (
-                    y_hat,
-                    ids_slice,
-                    x_mask,
-                    z_mask,
-                    (z, z_p, m_p, logs_p, m_q, logs_q),
-                ) = net_g(phone, phone_lengths, spec, spec_lengths, sid)
+                y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(
+                    phone, phone_lengths, spec, spec_lengths, sid
+                )
+
             mel = spec_to_mel_torch(
                 spec,
                 hps.data.filter_length,
@@ -408,6 +378,7 @@ def train_and_evaluate(
             y_mel = commons.slice_segments(
                 mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
+
             with autocast(enabled=False):
                 y_hat_mel = mel_spectrogram_torch(
                     y_hat.float().squeeze(1),
@@ -419,98 +390,157 @@ def train_and_evaluate(
                     hps.data.mel_fmin,
                     hps.data.mel_fmax,
                 )
+
             if hps.train.fp16_run == True:
                 y_hat_mel = y_hat_mel.half()
+
             wave = commons.slice_segments(
                 wave, ids_slice * hps.data.hop_length, hps.train.segment_size
             )
 
+            # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
+
             with autocast(enabled=False):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
-        optim_d.zero_grad()
-        scaler.scale(loss_disc).backward()
-        scaler.unscale_(optim_d)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
 
-        with autocast(enabled=hps.train.fp16_run):
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
+            optim_d.zero_grad()
+            scaler.scale(loss_disc).backward()
+            scaler.unscale_(optim_d)
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            scaler.step(optim_d)
+
+            # Generator
+            with autocast(enabled=hps.train.fp16_run):
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
+
             with autocast(enabled=False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
-        optim_g.zero_grad()
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
 
-        if rank == 0:
-            if global_step % hps.train.log_interval == 0:
-                lr = optim_g.param_groups[0]["lr"]
-                logger.info(
-                    "Train Epoch: {} [{:.0f}%]".format(
-                        epoch, 100.0 * batch_idx / len(train_loader)
+            optim_g.zero_grad()
+            scaler.scale(loss_gen_all).backward()
+            scaler.unscale_(optim_g)
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            scaler.step(optim_g)
+            scaler.update()
+
+            # ============================================================
+            # 🔥 КРУТЫЕ ЛОГИ - ВЫВОД В СТИЛЕ СКРИНА
+            # ============================================================
+            if rank == 0:
+                if global_step % hps.train.log_interval == 0:
+                    lr = optim_g.param_groups[0]["lr"]
+
+                    # Стандартные логи
+                    logger.info(
+                        "Train Epoch: {} [{:.0f}%]".format(
+                            epoch, 100.0 * batch_idx / len(train_loader)
+                        )
                     )
-                )
-                if loss_mel > 75:
-                    loss_mel = 75
-                if loss_kl > 9:
-                    loss_kl = 9
 
-                logger.info([global_step, lr])
-                logger.info(
-                    f"loss_disc={loss_disc:.3f}, loss_gen={loss_gen:.3f}, loss_fm={loss_fm:.3f},loss_mel={loss_mel:.3f}, loss_kl={loss_kl:.3f}"
-                )
-                scalar_dict = {
-                    "loss/g/total": loss_gen_all,
-                    "loss/d/total": loss_disc,
-                    "learning_rate": lr,
-                    "grad_norm_d": grad_norm_d,
-                    "grad_norm_g": grad_norm_g,
-                }
-                scalar_dict.update(
-                    {
+                    if loss_mel > 75:
+                        loss_mel = 75
+                    if loss_kl > 9:
+                        loss_kl = 9
+
+                    logger.info([global_step, lr])
+                    logger.info(
+                        f"loss_disc={loss_disc:.3f}, loss_gen={loss_gen:.3f}, "
+                        f"loss_fm={loss_fm:.3f}, loss_mel={loss_mel:.3f}, loss_kl={loss_kl:.3f}"
+                    )
+
+                    # ============================================================
+                    # КРУТЫЕ ЛОГИ С TENSORBOARD
+                    # ============================================================
+                    if metrics_tracker is not None:
+                        try:
+                            current_mel = float(loss_mel.detach().cpu().item())
+                            current_total = float(loss_gen_all.detach().cpu().item())
+
+                            # Получаем лучшую эпоху из TensorBoard
+                            best_epoch, best_mel = metrics_tracker.find_best_epoch("loss/g/mel")
+
+                            if best_epoch is None or best_mel is None:
+                                best_epoch, best_mel = epoch, current_mel
+
+                            # Проверка перетренировки
+                            patience = getattr(hps.train, "overtrain_patience", 20)
+                            is_overtraining = metrics_tracker.check_overtraining(
+                                current_epoch=epoch,
+                                current_loss=current_mel,
+                                patience=patience,
+                            )
+
+                            # ВЫВОД В СТИЛЕ СКРИНА
+                            logger.info("="*70)
+                            logger.info(
+                                f"[{epoch_recorder.record()}]: Model ▶ Эпоха {epoch}/{hps.train.epochs} "
+                                f"(Шаг {global_step}) || "
+                                f"Mel: {current_mel*100:.2f}% ▶ Рекорд: {best_mel*100:.2f}% (Эпоха {best_epoch})"
+                            )
+
+                            if is_overtraining:
+                                logger.info(f"⚠️  [Возможна перетренировка] Нет улучшения за {patience} эпох!")
+                                logger.info(f"   Лучший результат был на эпохе {best_epoch}")
+
+                            logger.info("="*70)
+
+                        except Exception as e:
+                            logger.info(f"⚠️  Ошибка крутых логов: {e}")
+                    # ============================================================
+
+                    # TensorBoard scalar logging
+                    scalar_dict = {
+                        "loss/g/total": loss_gen_all,
+                        "loss/d/total": loss_disc,
+                        "learning_rate": lr,
+                        "grad_norm_d": grad_norm_d,
+                        "grad_norm_g": grad_norm_g,
+                    }
+                    scalar_dict.update({
                         "loss/g/fm": loss_fm,
                         "loss/g/mel": loss_mel,
                         "loss/g/kl": loss_kl,
+                    })
+                    scalar_dict.update(
+                        {"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)}
+                    )
+                    scalar_dict.update(
+                        {"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)}
+                    )
+                    scalar_dict.update(
+                        {"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)}
+                    )
+
+                    image_dict = {
+                        "slice/mel_org": utils.plot_spectrogram_to_numpy(
+                            y_mel[0].data.cpu().numpy()
+                        ),
+                        "slice/mel_gen": utils.plot_spectrogram_to_numpy(
+                            y_hat_mel[0].data.cpu().numpy()
+                        ),
+                        "all/mel": utils.plot_spectrogram_to_numpy(
+                            mel[0].data.cpu().numpy()
+                        ),
                     }
-                )
 
-                scalar_dict.update(
-                    {"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)}
-                )
-                scalar_dict.update(
-                    {"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)}
-                )
-                scalar_dict.update(
-                    {"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)}
-                )
-                image_dict = {
-                    "slice/mel_org": utils.plot_spectrogram_to_numpy(
-                        y_mel[0].data.cpu().numpy()
-                    ),
-                    "slice/mel_gen": utils.plot_spectrogram_to_numpy(
-                        y_hat_mel[0].data.cpu().numpy()
-                    ),
-                    "all/mel": utils.plot_spectrogram_to_numpy(
-                        mel[0].data.cpu().numpy()
-                    ),
-                }
-                utils.summarize(
-                    writer=writer,
-                    global_step=global_step,
-                    images=image_dict,
-                    scalars=scalar_dict,
-                )
-        global_step += 1
+                    utils.summarize(
+                        writer=writer,
+                        global_step=global_step,
+                        images=image_dict,
+                        scalars=scalar_dict,
+                    )
+            # ============================================================
 
+            global_step += 1
+
+    # Save checkpoints
     if epoch % hps.save_every_epoch == 0 and rank == 0:
         if hps.if_latest == 0:
             utils.save_checkpoint(
@@ -542,11 +572,13 @@ def train_and_evaluate(
                 epoch,
                 os.path.join(hps.model_dir, "D_{}.pth".format(2333333)),
             )
+
         if rank == 0 and hps.save_every_weights == "1":
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
             else:
                 ckpt = net_g.state_dict()
+
             logger.info(
                 "saving ckpt %s_e%s:%s"
                 % (
@@ -564,48 +596,9 @@ def train_and_evaluate(
                 )
             )
 
-    # === NEW: Enhanced metrics logging from TensorBoard ===
-    if rank == 0 and logger is not None:
-        current_mel = float(loss_mel.detach().cpu().item())
-        current_total = float(loss_gen_all.detach().cpu().item())
-
-        best_epoch, best_mel = metrics_tracker.find_best_epoch("loss/g/mel")
-        if best_epoch is None or best_mel is None:
-            best_epoch, best_mel = epoch, current_mel
-
-        patience = getattr(hps.train, "overtrain_patience", 20)
-        is_overtraining = metrics_tracker.check_overtraining(
-            current_epoch=epoch,
-            current_loss=current_mel,
-            patience=patience,
-        )
-
-        logger.info("Syncing metrics from TensorBoard...")
-        logger.info(
-            f"Last Mel: {current_mel * 100:.2f}% | "
-            f"Best Mel: {best_mel * 100:.2f}% (at epoch {best_epoch})"
-        )
-
-        pretty_line = format_training_log(
-            epoch=epoch,
-            total_epochs=hps.train.epochs,
-            mel_loss=current_mel,
-            total_loss=current_total,
-            best_mel=best_mel,
-            best_epoch=best_epoch,
-            is_overtraining=is_overtraining,
-        )
-        logger.info(pretty_line)
-
-        if is_overtraining:
-            logger.info(
-                f"[Possible Overtraining] No improvement for {patience} epochs. "
-                "Check loss/g/mel and loss/g/total in TensorBoard."
-            )
-    # ======================================================
-
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
+
     if epoch >= hps.total_epoch and rank == 0:
         logger.info("Training is done. The program is closed.")
 
@@ -613,13 +606,10 @@ def train_and_evaluate(
             ckpt = net_g.module.state_dict()
         else:
             ckpt = net_g.state_dict()
+
         logger.info(
             "saving final ckpt:%s"
-            % (
-                savee(
-                    ckpt, hps.sample_rate, hps.if_f0, hps.name, epoch, hps.version, hps
-                )
-            )
+            % (savee(ckpt, hps.sample_rate, hps.if_f0, hps.name, epoch, hps.version, hps))
         )
         sleep(1)
         os._exit(2333333)
