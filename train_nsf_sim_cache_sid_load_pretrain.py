@@ -1,32 +1,23 @@
 import os, sys
-from tqdm import tqdm
-
-now_dir = os.getcwd()
-sys.path.append(os.path.join(now_dir))
-
-from lib.train.utils import EpochRecorder  # Import the EpochRecorder class #vara2
-
-hps = utils.get_hparams()
-os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
-n_gpus = len(hps.gpus.split("-"))
-
-import os
-import sys
-import datetime
-from random import shuffle, randint
-import torch
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
 
 from lib.train import utils
-from lib.train.data_utils import (
-    TextAudioLoaderMultiNSFsid,
-    TextAudioLoader,
-    TextAudioCollateMultiNSFsid,
-    TextAudioCollate,
-    DistributedBucketSampler,
-)
+import datetime
+
+hps = utils.get_hparams()
+os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
+n_gpus = len(hps.gpus.split("-"))
+from random import shuffle, randint
+
+import torch
+
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -34,7 +25,17 @@ from torch.cuda.amp import autocast, GradScaler
 from lib.infer_pack import commons
 from time import sleep
 from time import time as ttime
+from lib.train.data_utils import (
+    TextAudioLoaderMultiNSFsid,
+    TextAudioLoader,
+    TextAudioCollateMultiNSFsid,
+    TextAudioCollate,
+    DistributedBucketSampler,
 )
+
+# === NEW: Enhanced TensorBoard metrics tracker ===
+from utils.tensorboard_logger import TensorBoardMetricsTracker, format_training_log
+# =================================================
 
 if hps.version == "v1":
     from lib.infer_pack.models import (
@@ -53,6 +54,10 @@ from lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from lib.train.process_ckpt import savee
 
 global_step = 0
+# === NEW: Global metrics tracker ===
+metrics_tracker = None
+# ===================================
+
 
 class EpochRecorder:
     def __init__(self):
@@ -73,7 +78,6 @@ def main():
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
         n_gpus = 1
     if n_gpus < 1:
-        # patch to unblock people without gpus. there is probably a better way.
         print("NO GPU DETECTED: falling back to CPU - this may take a while")
         n_gpus = 1
     os.environ["MASTER_ADDR"] = "localhost"
@@ -94,21 +98,21 @@ def main():
     for i in range(n_gpus):
         children[i].join()
 
+
 def run(rank, n_gpus, hps):
     global global_step
+    global metrics_tracker
+
     if rank == 0:
-        logger = utils.get_logger(hps.model_dir, rank)  # Modify this line
+        logger = utils.get_logger(hps.model_dir)
         logger.info(hps)
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
-        # Создаем экземпляр EpochRecorder для записи времени и эпохи в лог
-        epoch_recorder = EpochRecorder()
 
     dist.init_process_group(
         backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
     )
-    torch.manual_seed
-
+    torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
@@ -119,12 +123,11 @@ def run(rank, n_gpus, hps):
     train_sampler = DistributedBucketSampler(
         train_dataset,
         hps.train.batch_size * n_gpus,
-        [100, 200, 300, 400, 500, 600, 700, 800, 900],  # 16s
+        [100, 200, 300, 400, 500, 600, 700, 800, 900],
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
     )
-
     if hps.if_f0 == 1:
         collate_fn = TextAudioCollateMultiNSFsid()
     else:
@@ -139,6 +142,11 @@ def run(rank, n_gpus, hps):
         persistent_workers=True,
         prefetch_factor=8,
     )
+
+    # === NEW: Initialize TensorBoard metrics tracker ===
+    if rank == 0:
+        metrics_tracker = TensorBoardMetricsTracker(log_dir=hps.model_dir)
+    # ===================================================
 
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
@@ -172,7 +180,6 @@ def run(rank, n_gpus, hps):
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
-
     if torch.cuda.is_available():
         net_g = DDP(net_g, device_ids=[rank])
         net_d = DDP(net_d, device_ids=[rank])
@@ -220,17 +227,7 @@ def run(rank, n_gpus, hps):
     scaler = GradScaler(enabled=hps.train.fp16_run)
 
     cache = []
-for epoch in range(epoch_str, hps.train.epochs + 1):
-    if rank == 0:
-        train_loader = tqdm(train_loader)  # Оборачиваем DataLoader в tqdm для создания прогресс-бара
-
-    for batch_idx, info in enumerate(train_loader):
-        # Ваш код обучения здесь
-
-        if rank == 0:
-            # Обновляем прогресс-бар после каждой итерации
-            train_loader.set_description(f'Epoch {epoch}')
-        
+    for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
             train_and_evaluate(
                 rank,
@@ -245,32 +242,30 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
                 [writer, writer_eval],
                 cache,
             )
-    else:
-        train_and_evaluate(
-            rank,
-            epoch,
-            hps,
-            [net_g, net_d],
-            [optim_g, optim_d],
-            [scheduler_g, scheduler_d],
-            scaler,
-            [train_loader, None],
-            None,
-            None,
-            cache,
-        )
-    
-    # Вывод текущей эпохи
-    print(f"Эпоха {epoch} завершена")
-    time.sleep(1)  # Для предотвращения слишком быстрого вывода
-
-    scheduler_g.step()
-    scheduler_d.step()
+        else:
+            train_and_evaluate(
+                rank,
+                epoch,
+                hps,
+                [net_g, net_d],
+                [optim_g, optim_d],
+                [scheduler_g, scheduler_d],
+                scaler,
+                [train_loader, None],
+                None,
+                None,
+                cache,
+            )
+        scheduler_g.step()
+        scheduler_d.step()
 
 
 def train_and_evaluate(
     rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache
 ):
+    global global_step
+    global metrics_tracker
+
     net_g, net_d = nets
     optim_g, optim_d = optims
     train_loader, eval_loader = loaders
@@ -278,19 +273,15 @@ def train_and_evaluate(
         writer, writer_eval = writers
 
     train_loader.batch_sampler.set_epoch(epoch)
-    global global_step
 
     net_g.train()
     net_d.train()
 
     # Prepare data iterator
     if hps.if_cache_data_in_gpu == True:
-        # Use Cache
         data_iterator = cache
         if cache == []:
-            # Make new cache
             for batch_idx, info in enumerate(train_loader):
-                # Unpack
                 if hps.if_f0 == 1:
                     (
                         phone,
@@ -313,7 +304,6 @@ def train_and_evaluate(
                         wave_lengths,
                         sid,
                     ) = info
-                # Load on CUDA
                 if torch.cuda.is_available():
                     phone = phone.cuda(rank, non_blocking=True)
                     phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -325,7 +315,6 @@ def train_and_evaluate(
                     spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
                     wave = wave.cuda(rank, non_blocking=True)
                     wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
-                # Cache on list
                 if hps.if_f0 == 1:
                     cache.append(
                         (
@@ -359,17 +348,12 @@ def train_and_evaluate(
                         )
                     )
         else:
-            # Load shuffled cache
             shuffle(cache)
     else:
-        # Loader
         data_iterator = enumerate(train_loader)
 
-    # Run steps
     epoch_recorder = EpochRecorder()
     for batch_idx, info in data_iterator:
-        # Data
-        ## Unpack
         if hps.if_f0 == 1:
             (
                 phone,
@@ -384,7 +368,7 @@ def train_and_evaluate(
             ) = info
         else:
             phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
-        ## Load on CUDA
+        
         if (hps.if_cache_data_in_gpu == False) and torch.cuda.is_available():
             phone = phone.cuda(rank, non_blocking=True)
             phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -395,9 +379,7 @@ def train_and_evaluate(
             spec = spec.cuda(rank, non_blocking=True)
             spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
             wave = wave.cuda(rank, non_blocking=True)
-            # wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
 
-        # Calculate
         with autocast(enabled=hps.train.fp16_run):
             if hps.if_f0 == 1:
                 (
@@ -441,9 +423,8 @@ def train_and_evaluate(
                 y_hat_mel = y_hat_mel.half()
             wave = commons.slice_segments(
                 wave, ids_slice * hps.data.hop_length, hps.train.segment_size
-            )  # slice
+            )
 
-            # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
             with autocast(enabled=False):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
@@ -456,7 +437,6 @@ def train_and_evaluate(
         scaler.step(optim_d)
 
         with autocast(enabled=hps.train.fp16_run):
-            # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
             with autocast(enabled=False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
@@ -479,7 +459,6 @@ def train_and_evaluate(
                         epoch, 100.0 * batch_idx / len(train_loader)
                     )
                 )
-                # Amor For Tensorboard display
                 if loss_mel > 75:
                     loss_mel = 75
                 if loss_kl > 9:
@@ -531,7 +510,6 @@ def train_and_evaluate(
                     scalars=scalar_dict,
                 )
         global_step += 1
-    # /Run steps
 
     if epoch % hps.save_every_epoch == 0 and rank == 0:
         if hps.if_latest == 0:
@@ -585,6 +563,46 @@ def train_and_evaluate(
                     ),
                 )
             )
+
+    # === NEW: Enhanced metrics logging from TensorBoard ===
+    if rank == 0 and logger is not None:
+        current_mel = float(loss_mel.detach().cpu().item())
+        current_total = float(loss_gen_all.detach().cpu().item())
+
+        best_epoch, best_mel = metrics_tracker.find_best_epoch("loss/g/mel")
+        if best_epoch is None or best_mel is None:
+            best_epoch, best_mel = epoch, current_mel
+
+        patience = getattr(hps.train, "overtrain_patience", 20)
+        is_overtraining = metrics_tracker.check_overtraining(
+            current_epoch=epoch,
+            current_loss=current_mel,
+            patience=patience,
+        )
+
+        logger.info("Syncing metrics from TensorBoard...")
+        logger.info(
+            f"Last Mel: {current_mel * 100:.2f}% | "
+            f"Best Mel: {best_mel * 100:.2f}% (at epoch {best_epoch})"
+        )
+
+        pretty_line = format_training_log(
+            epoch=epoch,
+            total_epochs=hps.train.epochs,
+            mel_loss=current_mel,
+            total_loss=current_total,
+            best_mel=best_mel,
+            best_epoch=best_epoch,
+            is_overtraining=is_overtraining,
+        )
+        logger.info(pretty_line)
+
+        if is_overtraining:
+            logger.info(
+                f"[Possible Overtraining] No improvement for {patience} epochs. "
+                "Check loss/g/mel and loss/g/total in TensorBoard."
+            )
+    # ======================================================
 
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
